@@ -11,6 +11,19 @@ import requests
 logger = logging.getLogger("azure-speech-transcriber")
 
 
+def _find_ffmpeg() -> str | None:
+    executable = shutil.which("ffmpeg")
+    if executable:
+        return executable
+
+    winget_root = Path(os.getenv("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
+    if winget_root.exists():
+        matches = winget_root.glob("Gyan.FFmpeg*/**/bin/ffmpeg.exe")
+        match = next(matches, None)
+        return str(match) if match else None
+    return None
+
+
 class AzureSpeechTranscriber:
     """Extract audio locally and transcribe it with Azure AI Speech."""
 
@@ -36,7 +49,8 @@ class AzureSpeechTranscriber:
         """Convert a video file to mono 16 kHz PCM WAV for Speech."""
         if output_path is None:
             output_path = str(Path(video_path).with_suffix(".wav"))
-        if shutil.which("ffmpeg") is None:
+        ffmpeg = _find_ffmpeg()
+        if ffmpeg is None:
             raise RuntimeError(
                 "ffmpeg is required for Azure Speech transcription. "
                 "Install ffmpeg and add it to PATH, then restart the terminal."
@@ -45,7 +59,7 @@ class AzureSpeechTranscriber:
         try:
             subprocess.run(
                 [
-                    "ffmpeg", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000",
+                    ffmpeg, "-i", video_path, "-vn", "-ac", "1", "-ar", "16000",
                     "-acodec", "pcm_s16le", "-y", output_path,
                 ],
                 check=True,

@@ -21,7 +21,9 @@ def setup_telemetry():
 
     #retrieve connection string 
 
-    connection_string=os.getenv("APPLICATION_INSIGHTS_CONNECTION_STRING")
+    connection_string = os.getenv(
+        "APPLICATION_INSIGHTS_CONNECTION_STRING"
+    ) or os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING")
 
     #CHECK IF CONFIGURED
 

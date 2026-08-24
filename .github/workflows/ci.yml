@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.14
+      - name: Install dependencies
+        run: uv sync --locked --no-dev
+      - name: Validate configuration interface
+        run: uv run python -m backend.scripts.validate_config
+        env:
+          USE_FAST_TRANSCRIPTION: "true"
+          AZURE_OPENAI_ENDPOINT: https://example.openai.azure.com/
+          AZURE_OPENAI_API_KEY: ci-placeholder
+          AZURE_OPENAI_CHAT_DEPLOYMENT: ci-chat
+          AZURE_OPENAI_EMBEDDING_DEPLOYMENT: ci-embedding
+          AZURE_SEARCH_ENDPOINT: https://example.search.windows.net
+          AZURE_SEARCH_API_KEY: ci-placeholder
+          AZURE_SEARCH_INDEX_NAME: ci-index
+          AZURE_SPEECH_ENDPOINT: https://example.stt.speech.microsoft.com
+          AZURE_SPEECH_KEY: ci-placeholder
+          AZURE_SPEECH_REGION: eastus
+      - name: Run tests
+        run: uv run python -m unittest discover -s backend/tests
+
+  container:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build container
+        run: docker build --tag video-compliance-analyzer:ci .

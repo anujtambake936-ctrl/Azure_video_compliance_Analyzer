@@ -1,7 +1,7 @@
 import logging
 import os
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,10 +21,16 @@ setup_telemetry()
 
 from backend.src.graph.workflow import app as compliance_graph
 from backend.src.graph.workflow_fast import app as compliance_graph_fast
+from backend.src.services.report_store import (
+    delete_report,
+    get_report,
+    list_reports,
+    save_report,
+)
 
 # Choose which workflow to use based on env var
 USE_FAST_MODE = os.getenv("USE_FAST_TRANSCRIPTION", "false").lower() == "true"
-active_graph = compliance_graph_fast if USE_FAST_MODE else compliance_graph
+DEFAULT_MODE = "fast" if USE_FAST_MODE else "full"
 
 if USE_FAST_MODE:
     logger.info("Fast mode enabled: Using Azure Speech transcription")
@@ -56,6 +62,7 @@ executor = ThreadPoolExecutor(max_workers=4)
 
 class AuditRequest(BaseModel):
     video_url: HttpUrl
+    processing_mode: Optional[Literal["fast", "full"]] = None
 
 
 class ComplianceFinding(BaseModel):
@@ -69,6 +76,7 @@ class AuditJobResponse(BaseModel):
     job_id: str
     status: str  # "pending", "processing", "completed", "failed"
     message: str
+    processing_mode: str
 
 
 class AuditStatusResponse(BaseModel):
@@ -81,6 +89,7 @@ class AuditStatusResponse(BaseModel):
     completed_at: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    processing_mode: str = "full"
 
 
 class AuditResponse(BaseModel):
@@ -126,7 +135,9 @@ def _missing_env_vars() -> List[str]:
     return [name for name in required if not os.getenv(name)]
 
 
-def run_audit_sync(job_id: str, video_url: str, video_id_short: str):
+def run_audit_sync(
+    job_id: str, video_url: str, video_id_short: str, processing_mode: str
+):
     """Background job that runs the audit workflow"""
     try:
         job_store[job_id]["status"] = "processing"
@@ -139,12 +150,16 @@ def run_audit_sync(job_id: str, video_url: str, video_id_short: str):
             "errors": [],
         }
 
-        final_state = active_graph.invoke(initial_inputs)
+        graph = compliance_graph_fast if processing_mode == "fast" else compliance_graph
+        final_state = graph.invoke(initial_inputs)
 
         result = {
             "session_id": job_id,
             "video_id": video_id_short,
             "video_url": video_url,
+            "processing_mode": processing_mode,
+            "created_at": job_store[job_id]["created_at"],
+            "completed_at": datetime.utcnow().isoformat(),
             "status": final_state.get("final_status", "UNKNOWN"),
             "risk_score": final_state.get("risk_score", 0),
             "video_summary": final_state.get("video_summary", ""),
@@ -156,7 +171,8 @@ def run_audit_sync(job_id: str, video_url: str, video_id_short: str):
 
         job_store[job_id]["status"] = "completed"
         job_store[job_id]["result"] = result
-        job_store[job_id]["completed_at"] = datetime.utcnow().isoformat()
+        job_store[job_id]["completed_at"] = result["completed_at"]
+        save_report(job_id, result)
 
         logger.info(f"[Job {job_id}] Completed successfully")
 
@@ -184,6 +200,7 @@ async def submit_audit(request: AuditRequest, background_tasks: BackgroundTasks)
     """Submit a video for audit. Returns immediately with a job ID."""
     job_id = str(uuid.uuid4())
     video_id_short = f"vid_{job_id[:8]}"
+    processing_mode = request.processing_mode or DEFAULT_MODE
 
     logger.info(f"[Job {job_id}] Received audit request: {request.video_url}")
 
@@ -197,18 +214,32 @@ async def submit_audit(request: AuditRequest, background_tasks: BackgroundTasks)
         "completed_at": None,
         "result": None,
         "error": None,
+        "processing_mode": processing_mode,
     }
 
     # Schedule background job
     background_tasks.add_task(
-        lambda: executor.submit(run_audit_sync, job_id, str(request.video_url), video_id_short)
+        lambda: executor.submit(
+            run_audit_sync,
+            job_id,
+            str(request.video_url),
+            video_id_short,
+            processing_mode,
+        )
     )
 
     return AuditJobResponse(
         job_id=job_id,
         status="pending",
         message="Audit job submitted. Use GET /audit/{job_id} to check status.",
+        processing_mode=processing_mode,
     )
+
+
+@app.get("/reports")
+def get_saved_reports() -> List[Dict[str, Any]]:
+    """Return completed reports persisted on this service instance."""
+    return list_reports()
 
 
 @app.get("/audit/{job_id}", response_model=AuditStatusResponse)
@@ -218,6 +249,7 @@ def get_audit_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = job_store[job_id]
+    result = job.get("result") or get_report(job_id)
 
     return AuditStatusResponse(
         job_id=job["job_id"],
@@ -226,8 +258,9 @@ def get_audit_status(job_id: str):
         video_id=job.get("video_id"),
         created_at=job["created_at"],
         completed_at=job.get("completed_at"),
-        result=job.get("result"),
+        result=result,
         error=job.get("error"),
+        processing_mode=job.get("processing_mode", DEFAULT_MODE),
     )
 
 
@@ -242,4 +275,5 @@ def delete_audit_job(job_id: str):
         raise HTTPException(status_code=400, detail="Cannot delete a running job")
 
     del job_store[job_id]
+    delete_report(job_id)
     return {"message": "Job deleted", "job_id": job_id}

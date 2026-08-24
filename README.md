@@ -49,7 +49,8 @@ video-compliance-analyzer/
 │   │   ├── 1001a-influencer-guide-508_1.pdf
 │   │   └── youtube-ad-specs.pdf
 │   ├── scripts/
-│   │   └── index_documents.py       # One-time script to populate Azure AI Search
+│   │   ├── index_documents.py       # Populate Azure AI Search
+│   │   └── validate_config.py       # Validate required environment variables
 │   └── src/
 │       ├── api/
 │       │   ├── server.py            # FastAPI server with /audit and /health endpoints
@@ -63,8 +64,9 @@ video-compliance-analyzer/
 │       └── services/
 │           ├── video_indexer.py     # YouTube download and Video Indexer API
 │           ├── azure_speech_transcriber.py # ffmpeg and Azure Speech
-│           └── video_cache.py       # Mode-specific local result cache
-├── main.py                          # CLI runner for local testing
+│           ├── video_cache.py       # Mode-specific local result cache
+│           └── report_store.py      # Persistent local JSON reports
+├── main.py                          # Interactive CLI runner
 ├── pyproject.toml                   # Dependencies (managed with uv)
 ├── .env.example                     # Environment variable template
 └── .gitignore
@@ -126,6 +128,18 @@ The number of indexed chunks depends on the PDFs in `backend/data/`.
 
 ## Running
 
+### Automated Checks
+
+Run the same checks used by CI before starting the service:
+
+```powershell
+uv run python -m backend.scripts.validate_config
+uv run python -m unittest discover -s backend/tests
+docker build --tag video-compliance-analyzer:local .
+```
+
+The GitHub Actions workflow in `.github/workflows/ci.yml` runs configuration validation with non-secret placeholders, the regression tests, and a Docker build for every push to `main` and every pull request targeting `main`.
+
 ### Performance Mode Toggle
 
 The pipeline supports two modes:
@@ -145,13 +159,21 @@ Use fast mode for lower-latency transcript-based audits. Use full mode when OCR 
 
 ---
 
-### CLI (local test)
+### CLI checker
 
-Runs a single audit against the hardcoded YouTube URL in `main.py`. The selected route follows `USE_FAST_TRANSCRIPTION`:
+Run the CLI, then enter a YouTube URL and choose `fast` or `full`:
 
 ```bash
 uv run python main.py
 ```
+
+Or provide both values directly:
+
+```bash
+uv run python main.py --url "https://youtu.be/YOUR_VIDEO_ID" --mode fast
+```
+
+The CLI saves the completed report under `backend/cache/reports/`.
 
 ### API Server
 
@@ -167,6 +189,7 @@ uv run uvicorn backend.src.api.server:app --reload --port 8000
 | `POST` | `/audit` | Submit a YouTube URL for audit (returns job_id immediately) |
 | `GET` | `/audit/{job_id}` | Poll for audit status and result |
 | `DELETE` | `/audit/{job_id}` | Delete a completed job |
+| `GET` | `/reports` | List reports saved on this API instance |
 
 **Example audit flow:**
 
@@ -174,7 +197,7 @@ uv run uvicorn backend.src.api.server:app --reload --port 8000
 # 1. Submit audit (returns immediately)
 curl -X POST http://localhost:8000/audit \
   -H "Content-Type: application/json" \
-  -d '{"video_url": "https://youtu.be/YOUR_VIDEO_ID"}' \
+  -d '{"video_url": "https://youtu.be/YOUR_VIDEO_ID", "processing_mode": "fast"}' \
   | jq .
 
 # Response:
@@ -186,6 +209,9 @@ curl -X POST http://localhost:8000/audit \
 
 # 2. Poll for status (repeat until status is "completed" or "failed")
 curl http://localhost:8000/audit/abc123-... | jq .
+
+# 3. List saved reports
+curl http://localhost:8000/reports | jq .
 
 # While processing:
 # {
@@ -271,7 +297,7 @@ The new content will be chunked and added to the existing Azure AI Search index.
 
 ## Observability
 
-When `APPLICATION_INSIGHTS_CONNECTION_STRING` is set, the API server initializes Azure Monitor OpenTelemetry. LangSmith tracing is optional and is enabled when its environment variables are configured.
+When `APPLICATION_INSIGHTS_CONNECTION_STRING` is set, the API server initializes Azure Monitor OpenTelemetry. LangSmith tracing is optional and should be disabled with `LANGCHAIN_TRACING_V2=false` unless a valid LangSmith key is configured.
 
 ---
 
@@ -283,8 +309,8 @@ For local container execution, use:
 docker compose up --build
 ```
 
-The API uses the `202 Accepted` job pattern and polls results through `/audit/{job_id}`. The Docker setup is suitable for demos; production deployment still requires durable job storage, managed identity, authentication, rate limiting, and secret management.
+The API uses the `202 Accepted` job pattern and polls results through `/audit/{job_id}`. Each request can choose `processing_mode` as `fast` or `full`. When omitted, the server uses `USE_FAST_TRANSCRIPTION` as the default. Completed reports are saved as JSON under `backend/cache/reports/`, which is mounted by Docker Compose, and can be listed with `GET /reports`. Docker runs the complete local runtime, including FFmpeg. It does not replace the external Azure services or remove the need for valid credentials.
 
 ## Prototype Scope
 
-This is a working demonstration pipeline, not a production-ready service. The current API uses an in-memory job store, has limited test coverage, and requires production hardening such as authentication, rate limiting, durable job storage, managed identity, secret management, and long-video Speech handling.
+This is a working prototype. Before production use, add authentication, rate limiting, durable job storage, managed identity or Key Vault, strict LLM output validation, and long-video Speech handling. The current API job metadata is in memory; saved reports are local JSON files.

@@ -11,7 +11,7 @@ import uuid
 import json
 import logging
 import os
-from pprint import pprint
+import argparse
 
 
 from dotenv import load_dotenv
@@ -26,13 +26,16 @@ logging.basicConfig(
 
 logger = logging.getLogger("compliance-analyzer-runner")
 
-# Select the processing route configured in .env.
-if os.getenv("USE_FAST_TRANSCRIPTION", "false").lower() == "true":
-    from backend.src.graph.workflow_fast import app
-    logger.info("Using Azure Speech fast workflow")
-else:
-    from backend.src.graph.workflow import app
-    logger.info("Using Azure Video Indexer full workflow")
+from backend.src.graph.workflow import app as full_app
+from backend.src.graph.workflow_fast import app as fast_app
+from backend.src.services.report_store import save_report
+
+
+def get_arguments():
+    parser = argparse.ArgumentParser(description="Audit a YouTube video for compliance.")
+    parser.add_argument("--url", help="YouTube video URL")
+    parser.add_argument("--mode", choices=("fast", "full"), help="Processing mode")
+    return parser.parse_args()
 
 
 def run_cli_simulation():
@@ -43,6 +46,14 @@ def run_cli_simulation():
     - Runs it through the AI workflow
     - Displays the compliance results
     """
+    arguments = get_arguments()
+    video_url = arguments.url or input("YouTube URL: ").strip()
+    processing_mode = arguments.mode
+    if processing_mode is None:
+        processing_mode = input("Processing mode (fast/full) [fast]: ").strip().lower() or "fast"
+    if processing_mode not in {"fast", "full"}:
+        raise ValueError("Processing mode must be 'fast' or 'full'.")
+
     # ======== STEP 1: GENERATE SESSION ID ========
     session_id = str(uuid.uuid4())
     logger.info(f"Starting Audit Session: {session_id}")
@@ -50,11 +61,12 @@ def run_cli_simulation():
     # ======== STEP 2: DEFINE INITIAL STATE ========
     initial_inputs = {
         # Target YouTube video URL
-        "video_url": "https://youtu.be/3jQ_toeu314?si=zaSiH3EHOpUUClaN",
+        "video_url": video_url,
         # Shortened video ID for tracking
         "video_id": f"vid_{session_id[:8]}",
         # Empty list to store compliance violations
         "compliance_results": [],
+        "processing_mode": processing_mode,
         # Empty list for system error tracking
         "errors": [],
     }
@@ -65,15 +77,32 @@ def run_cli_simulation():
 
     # ======== STEP 3: EXECUTE GRAPH ========
     try:
+        app = fast_app if processing_mode == "fast" else full_app
         # app.invoke() triggers the LangGraph workflow
         # Flow: START -> Indexer -> Auditor -> END
         final_state = app.invoke(initial_inputs)
+
+        report = {
+            "session_id": session_id,
+            "video_id": final_state.get("video_id", initial_inputs["video_id"]),
+            "video_url": video_url,
+            "processing_mode": processing_mode,
+            "status": final_state.get("final_status", "UNKNOWN"),
+            "risk_score": final_state.get("risk_score", 0),
+            "video_summary": final_state.get("video_summary", ""),
+            "final_report": final_state.get("final_report", ""),
+            "compliance_results": final_state.get("compliance_results", []),
+            "retrieved_rules": final_state.get("retrieved_rules", []),
+            "errors": final_state.get("errors", []),
+        }
+        save_report(session_id, report)
 
         # ======== DISPLAY SECTION: EXECUTION COMPLETE ========
         print("\n--- 2. WORKFLOW EXECUTION COMPLETE ---")
 
         # ======== STEP 4: OUTPUT RESULTS ========
         print("\n=== COMPLIANCE AUDIT REPORT ===")
+        print(f"Report ID:   {session_id}")
         print(f"Video ID:    {final_state.get('video_id', 'N/A')}")
         
         # Support either 'final_status' or 'status' key from state

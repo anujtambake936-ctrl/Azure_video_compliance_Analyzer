@@ -8,6 +8,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency files
