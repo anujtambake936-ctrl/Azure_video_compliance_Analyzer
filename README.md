@@ -1,6 +1,6 @@
 # Video Compliance Analyzer
 
-An agentic AI pipeline that audits YouTube videos for brand and regulatory compliance. It downloads a video, extracts its transcript and on-screen text using Azure Video Indexer, retrieves relevant compliance rules from a knowledge base using RAG, and produces a structured compliance report via an LLM.
+An end-to-end prototype pipeline that audits YouTube videos for brand and regulatory compliance. It supports a fast Azure AI Speech route and a detailed Azure Video Indexer route, retrieves relevant compliance rules with RAG, and produces a structured report with Azure OpenAI.
 
 ---
 
@@ -8,23 +8,16 @@ An agentic AI pipeline that audits YouTube videos for brand and regulatory compl
 
 ```
 YouTube URL
-    │
-    ▼
-┌─────────────────────────┐
-│  Node 1: Video Indexer  │  yt-dlp download → Azure Video Indexer
-│                         │  → transcript + OCR text extraction
-└────────────┬────────────┘
-             │
-             ▼
-┌─────────────────────────┐
-│  Node 2: Auditor        │  RAG retrieval from Azure AI Search
-│                         │  → GPT compliance audit
-│                         │  → structured JSON report
-└─────────────────────────┘
-             │
-             ▼
-  Compliance Report (PASS / FAIL)
-  Risk Score · Violations · Summary
+  │
+  ├── Fast mode: yt-dlp → ffmpeg → Azure AI Speech
+  │
+  └── Full mode: yt-dlp → Azure Video Indexer → transcript + OCR
+                │
+                ▼
+         Azure AI Search RAG → Azure OpenAI audit
+                │
+                ▼
+         Compliance report, risk score, and findings
 ```
 
 ---
@@ -37,7 +30,8 @@ YouTube URL
 | LLM | Azure OpenAI (GPT) |
 | Embeddings | Azure OpenAI (text-embedding-3-small) |
 | Knowledge Base | Azure AI Search (vector store) |
-| Video Processing | Azure Video Indexer |
+| Fast Transcription | Azure AI Speech |
+| Detailed Video Analysis | Azure Video Indexer |
 | Video Download | yt-dlp |
 | API Server | FastAPI |
 | Observability | Azure Monitor / OpenTelemetry |
@@ -61,11 +55,15 @@ video-compliance-analyzer/
 │       │   ├── server.py            # FastAPI server with /audit and /health endpoints
 │       │   └── telemetry.py         # Azure Monitor OpenTelemetry setup
 │       ├── graph/
-│       │   ├── workflow.py          # LangGraph DAG definition
-│       │   ├── nodes.py             # Node 1 (indexer) + Node 2 (auditor) logic
+│       │   ├── workflow.py          # Full Video Indexer graph
+│       │   ├── workflow_fast.py     # Fast Azure Speech graph
+│       │   ├── nodes.py             # Full-mode nodes
+│       │   ├── nodes_fast.py        # Fast-mode nodes
 │       │   └── state.py             # VideoAuditState TypedDict schema
 │       └── services/
-│           └── video_indexer.py     # Azure Video Indexer service wrapper
+│           ├── video_indexer.py     # YouTube download and Video Indexer API
+│           ├── azure_speech_transcriber.py # ffmpeg and Azure Speech
+│           └── video_cache.py       # Mode-specific local result cache
 ├── main.py                          # CLI runner for local testing
 ├── pyproject.toml                   # Dependencies (managed with uv)
 ├── .env.example                     # Environment variable template
@@ -79,9 +77,11 @@ video-compliance-analyzer/
 - Python 3.14+
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
 - Azure CLI installed and logged in (`az login`)
+- `ffmpeg` installed and available on `PATH` when using fast Azure Speech mode
 - The following Azure services provisioned:
   - Azure OpenAI (chat + embedding deployments)
   - Azure AI Search
+  - Azure AI Speech resource for fast mode
   - Azure Video Indexer
   - Azure Monitor / Application Insights (optional, for telemetry)
 
@@ -110,6 +110,8 @@ cp .env.example .env
 
 Fill in all values in `.env`. See the [Environment Variables](#environment-variables) section below.
 
+On Windows, install ffmpeg with `winget install Gyan.FFmpeg` and restart the terminal so the `ffmpeg` command is available.
+
 **4. Populate the knowledge base (run once)**
 
 This indexes the compliance PDFs in `backend/data/` into Azure AI Search:
@@ -118,19 +120,34 @@ This indexes the compliance PDFs in `backend/data/` into Azure AI Search:
 uv run python -m backend.scripts.index_documents
 ```
 
-You should see:
-```
-INFO - Indexing complete! Knowledge base is ready.
-INFO - Total chunks indexed: 37
-```
+The number of indexed chunks depends on the PDFs in `backend/data/`.
 
 ---
 
 ## Running
 
+### Performance Mode Toggle
+
+The pipeline supports two modes:
+
+| Mode | Transcription | Time (First Run) | Time (Cached) | OCR | Advanced Features |
+|---|---|---|---|---|---|
+| **Fast** (Azure Speech) | Azure AI Speech | **20–60s** | ~15s | ❌ No | ❌ No |
+| **Full** (Azure VI) | Azure Video Indexer | 5–10 min | ~15s | ✅ Yes | ✅ Speaker diarization, topics, brands |
+
+Set in `.env`:
+```env
+USE_FAST_TRANSCRIPTION=true   # Fast mode (20-60s)
+USE_FAST_TRANSCRIPTION=false  # Full mode (5-10min, default)
+```
+
+Use fast mode for lower-latency transcript-based audits. Use full mode when OCR and advanced video insights are required.
+
+---
+
 ### CLI (local test)
 
-Runs a single audit against the hardcoded YouTube URL in `main.py`:
+Runs a single audit against the hardcoded YouTube URL in `main.py`. The selected route follows `USE_FAST_TRANSCRIPTION`:
 
 ```bash
 uv run python main.py
@@ -147,36 +164,53 @@ uv run uvicorn backend.src.api.server:app --reload --port 8000
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Check service status and missing env vars |
-| `POST` | `/audit` | Submit a YouTube URL for compliance audit |
+| `POST` | `/audit` | Submit a YouTube URL for audit (returns job_id immediately) |
+| `GET` | `/audit/{job_id}` | Poll for audit status and result |
+| `DELETE` | `/audit/{job_id}` | Delete a completed job |
 
-**Example audit request:**
+**Example audit flow:**
 
 ```bash
+# 1. Submit audit (returns immediately)
 curl -X POST http://localhost:8000/audit \
   -H "Content-Type: application/json" \
-  -d '{"video_url": "https://youtu.be/YOUR_VIDEO_ID"}'
-```
+  -d '{"video_url": "https://youtu.be/YOUR_VIDEO_ID"}' \
+  | jq .
 
-**Example response:**
+# Response:
+# {
+#   "job_id": "abc123-...",
+#   "status": "pending",
+#   "message": "Audit job submitted. Use GET /audit/{job_id} to check status."
+# }
 
-```json
-{
-  "session_id": "14037395-...",
-  "video_id": "vid_14037395",
-  "status": "FAIL",
-  "risk_score": 76,
-  "video_summary": "A presenter introduces John Cena as the new face of Neutrogena...",
-  "compliance_results": [
-    {
-      "severity": "CRITICAL",
-      "category": "Endorsement Disclosure",
-      "description": "Celebrity endorsement present but no paid partnership disclosure found."
-    }
-  ],
-  "retrieved_rules": ["...rule chunk 1...", "...rule chunk 2..."],
-  "final_report": "The video contains a clear celebrity product endorsement...",
-  "errors": []
-}
+# 2. Poll for status (repeat until status is "completed" or "failed")
+curl http://localhost:8000/audit/abc123-... | jq .
+
+# While processing:
+# {
+#   "job_id": "abc123-...",
+#   "status": "processing",
+#   "video_url": "https://youtu.be/...",
+#   "created_at": "2026-07-28T10:00:00",
+#   "completed_at": null,
+#   "result": null
+# }
+
+# When complete:
+# {
+#   "job_id": "abc123-...",
+#   "status": "completed",
+#   "video_url": "https://youtu.be/...",
+#   "created_at": "2026-07-28T10:00:00",
+#   "completed_at": "2026-07-28T10:08:15",
+#   "result": {
+#     "status": "FAIL",
+#     "risk_score": 76,
+#     "compliance_results": [...],
+#     ...
+#   }
+# }
 ```
 
 ---
@@ -192,6 +226,12 @@ AZURE_OPENAI_API_KEY=
 AZURE_OPENAI_API_VERSION=2025-04-01-preview
 AZURE_OPENAI_CHAT_DEPLOYMENT=           # e.g. gpt-4o
 AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-small
+
+# Azure AI Speech (required for fast mode)
+AZURE_SPEECH_ENDPOINT=https://<region>.stt.speech.microsoft.com
+AZURE_SPEECH_KEY=
+AZURE_SPEECH_REGION=
+AZURE_SPEECH_LANGUAGE=en-US
 
 # Azure AI Search
 AZURE_SEARCH_ENDPOINT=https://<your-search-service>.search.windows.net
@@ -231,4 +271,19 @@ The new content will be chunked and added to the existing Azure AI Search index.
 
 ## Observability
 
-When `APPLICATION_INSIGHTS_CONNECTION_STRING` is set, the API server automatically sends telemetry to Azure Monitor via OpenTelemetry — including HTTP request traces, latency metrics, and error logs. LangSmith tracing captures the full LangGraph execution trace when `LANGCHAIN_API_KEY` is set.
+When `APPLICATION_INSIGHTS_CONNECTION_STRING` is set, the API server initializes Azure Monitor OpenTelemetry. LangSmith tracing is optional and is enabled when its environment variables are configured.
+
+---
+
+## Performance & Deployment
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for:
+- Async job queue architecture (202 Accepted pattern)
+- Video processing cache (instant results for repeat audits)
+- Docker / Azure Container Apps / AKS deployment guides
+- Production checklist and monitoring setup
+- Cost estimates and scaling strategies
+
+## Prototype Scope
+
+This is a working demonstration pipeline, not a production-ready service. The current API uses an in-memory job store, has limited test coverage, and requires production hardening such as authentication, rate limiting, durable job storage, managed identity, secret management, and long-video Speech handling.

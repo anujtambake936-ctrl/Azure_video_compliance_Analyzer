@@ -23,6 +23,7 @@ env/
 temp_audit_video_*.mp4
 temp_audit_video.mp4
 temp_video.mp4
+backend/cache/
 
 # Streamlit
 .streamlit/secrets.toml

@@ -2,12 +2,17 @@ import logging
 import os
 import uuid
 from typing import Any, Dict, List, Optional
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from fastapi import FastAPI, HTTPException
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("api-server")
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -15,9 +20,16 @@ from backend.src.api.telemetry import setup_telemetry
 setup_telemetry()
 
 from backend.src.graph.workflow import app as compliance_graph
+from backend.src.graph.workflow_fast import app as compliance_graph_fast
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("api-server")
+# Choose which workflow to use based on env var
+USE_FAST_MODE = os.getenv("USE_FAST_TRANSCRIPTION", "false").lower() == "true"
+active_graph = compliance_graph_fast if USE_FAST_MODE else compliance_graph
+
+if USE_FAST_MODE:
+    logger.info("Fast mode enabled: Using Azure Speech transcription")
+else:
+    logger.info("Full mode: Using Azure Video Indexer (~5-10min)")
 
 app = FastAPI(
     title="Video Compliance Analyzer",
@@ -33,11 +45,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# In-memory job store (use Redis/PostgreSQL in production)
+job_store: Dict[str, Dict[str, Any]] = {}
+
+# Thread pool for background jobs
+executor = ThreadPoolExecutor(max_workers=4)
+
 
 # ── Request / Response models ────────────────────────────────────────────────
 
 class AuditRequest(BaseModel):
-    video_url: str
+    video_url: HttpUrl
 
 
 class ComplianceFinding(BaseModel):
@@ -46,7 +64,27 @@ class ComplianceFinding(BaseModel):
     description: str
 
 
+class AuditJobResponse(BaseModel):
+    """Immediate response when audit is submitted"""
+    job_id: str
+    status: str  # "pending", "processing", "completed", "failed"
+    message: str
+
+
+class AuditStatusResponse(BaseModel):
+    """Response when polling for job status"""
+    job_id: str
+    status: str
+    video_url: str
+    video_id: Optional[str] = None
+    created_at: str
+    completed_at: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
 class AuditResponse(BaseModel):
+    """Final audit result"""
     session_id: str
     video_id: str
     video_url: str
@@ -70,13 +108,63 @@ def _missing_env_vars() -> List[str]:
         "AZURE_SEARCH_ENDPOINT",
         "AZURE_SEARCH_API_KEY",
         "AZURE_SEARCH_INDEX_NAME",
-        "AZURE_VI_NAME",
-        "AZURE_VI_LOCATION",
-        "AZURE_VI_ACCOUNT_ID",
-        "AZURE_SUBSCRIPTION_ID",
-        "AZURE_RESOURCE_GROUP",
     ]
+    if USE_FAST_MODE:
+        required.extend([
+            "AZURE_SPEECH_ENDPOINT",
+            "AZURE_SPEECH_KEY",
+            "AZURE_SPEECH_REGION",
+        ])
+    else:
+        required.extend([
+            "AZURE_VI_NAME",
+            "AZURE_VI_LOCATION",
+            "AZURE_VI_ACCOUNT_ID",
+            "AZURE_SUBSCRIPTION_ID",
+            "AZURE_RESOURCE_GROUP",
+        ])
     return [name for name in required if not os.getenv(name)]
+
+
+def run_audit_sync(job_id: str, video_url: str, video_id_short: str):
+    """Background job that runs the audit workflow"""
+    try:
+        job_store[job_id]["status"] = "processing"
+        logger.info(f"[Job {job_id}] Starting audit for {video_url}")
+
+        initial_inputs = {
+            "video_url": video_url,
+            "video_id": video_id_short,
+            "compliance_results": [],
+            "errors": [],
+        }
+
+        final_state = active_graph.invoke(initial_inputs)
+
+        result = {
+            "session_id": job_id,
+            "video_id": video_id_short,
+            "video_url": video_url,
+            "status": final_state.get("final_status", "UNKNOWN"),
+            "risk_score": final_state.get("risk_score", 0),
+            "video_summary": final_state.get("video_summary", ""),
+            "final_report": final_state.get("final_report", ""),
+            "compliance_results": final_state.get("compliance_results", []),
+            "retrieved_rules": final_state.get("retrieved_rules", []),
+            "errors": final_state.get("errors", []),
+        }
+
+        job_store[job_id]["status"] = "completed"
+        job_store[job_id]["result"] = result
+        job_store[job_id]["completed_at"] = datetime.utcnow().isoformat()
+
+        logger.info(f"[Job {job_id}] Completed successfully")
+
+    except Exception as e:
+        logger.exception(f"[Job {job_id}] Audit failed")
+        job_store[job_id]["status"] = "failed"
+        job_store[job_id]["error"] = str(e)
+        job_store[job_id]["completed_at"] = datetime.utcnow().isoformat()
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -87,42 +175,71 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok" if not missing else "degraded",
         "missing_environment_variables": missing,
+        "active_jobs": len([j for j in job_store.values() if j["status"] in ["pending", "processing"]]),
     }
 
 
-@app.post("/audit", response_model=AuditResponse)
-async def audit_video(request: AuditRequest):
-    session_id = str(uuid.uuid4())
-    video_id_short = f"vid_{session_id[:8]}"
+@app.post("/audit", response_model=AuditJobResponse, status_code=202)
+async def submit_audit(request: AuditRequest, background_tasks: BackgroundTasks):
+    """Submit a video for audit. Returns immediately with a job ID."""
+    job_id = str(uuid.uuid4())
+    video_id_short = f"vid_{job_id[:8]}"
 
-    logger.info(f"Received audit request: {request.video_url} (Session: {session_id})")
+    logger.info(f"[Job {job_id}] Received audit request: {request.video_url}")
 
-    initial_inputs = {
+    # Store job metadata
+    job_store[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
         "video_url": str(request.video_url),
         "video_id": video_id_short,
-        "compliance_results": [],
-        "errors": [],
+        "created_at": datetime.utcnow().isoformat(),
+        "completed_at": None,
+        "result": None,
+        "error": None,
     }
 
-    try:
-        final_state = compliance_graph.invoke(initial_inputs)
+    # Schedule background job
+    background_tasks.add_task(
+        lambda: executor.submit(run_audit_sync, job_id, str(request.video_url), video_id_short)
+    )
 
-        return AuditResponse(
-            session_id=session_id,
-            video_id=video_id_short,
-            video_url=str(request.video_url),
-            status=final_state.get("final_status", "UNKNOWN"),
-            risk_score=final_state.get("risk_score", 0),
-            video_summary=final_state.get("video_summary", ""),
-            final_report=final_state.get("final_report", ""),
-            compliance_results=final_state.get("compliance_results", []),
-            retrieved_rules=final_state.get("retrieved_rules", []),
-            errors=final_state.get("errors", []),
-        )
+    return AuditJobResponse(
+        job_id=job_id,
+        status="pending",
+        message="Audit job submitted. Use GET /audit/{job_id} to check status.",
+    )
 
-    except Exception as e:
-        logger.exception("Audit graph failed")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Audit workflow failed: {str(e)}",
-        )
+
+@app.get("/audit/{job_id}", response_model=AuditStatusResponse)
+def get_audit_status(job_id: str):
+    """Poll for audit job status and result."""
+    if job_id not in job_store:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = job_store[job_id]
+
+    return AuditStatusResponse(
+        job_id=job["job_id"],
+        status=job["status"],
+        video_url=job["video_url"],
+        video_id=job.get("video_id"),
+        created_at=job["created_at"],
+        completed_at=job.get("completed_at"),
+        result=job.get("result"),
+        error=job.get("error"),
+    )
+
+
+@app.delete("/audit/{job_id}")
+def delete_audit_job(job_id: str):
+    """Delete a completed or failed job from the store."""
+    if job_id not in job_store:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = job_store[job_id]
+    if job["status"] in ["pending", "processing"]:
+        raise HTTPException(status_code=400, detail="Cannot delete a running job")
+
+    del job_store[job_id]
+    return {"message": "Job deleted", "job_id": job_id}

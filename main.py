@@ -10,15 +10,13 @@ audit workflow. It:
 import uuid
 import json
 import logging
+import os
 from pprint import pprint
 
 
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-
-# Import compiled workflow graph
-from backend.src.graph.workflow import app
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +25,14 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("compliance-analyzer-runner")
+
+# Select the processing route configured in .env.
+if os.getenv("USE_FAST_TRANSCRIPTION", "false").lower() == "true":
+    from backend.src.graph.workflow_fast import app
+    logger.info("Using Azure Speech fast workflow")
+else:
+    from backend.src.graph.workflow import app
+    logger.info("Using Azure Video Indexer full workflow")
 
 
 def run_cli_simulation():
@@ -44,7 +50,7 @@ def run_cli_simulation():
     # ======== STEP 2: DEFINE INITIAL STATE ========
     initial_inputs = {
         # Target YouTube video URL
-        "video_url": "https://youtu.be/dT7S75eYhcQ?si=iTxndT1i-On1zQSD",
+        "video_url": "https://youtu.be/3jQ_toeu314?si=zaSiH3EHOpUUClaN",
         # Shortened video ID for tracking
         "video_id": f"vid_{session_id[:8]}",
         # Empty list to store compliance violations

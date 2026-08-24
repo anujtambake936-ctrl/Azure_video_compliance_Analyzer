@@ -1,3 +1,7 @@
+"""Fast version of nodes.py using Azure Speech instead of Azure Video Indexer.
+
+This bypasses the 3-10 minute Video Indexer processing time.
+"""
 import json
 import logging
 import os
@@ -14,80 +18,74 @@ from backend.src.graph.state import VideoAuditState
 
 # Import services
 from backend.src.services.video_indexer import VideoIndexerService, is_youtube_url
+from backend.src.services.azure_speech_transcriber import AzureSpeechTranscriber
 from backend.src.services.video_cache import get_cached_result, save_to_cache
 
-logger = logging.getLogger("nodes")
+logger = logging.getLogger("nodes-fast")
 logging.basicConfig(level=logging.INFO)
 
 
-
-
 # ============================================================================
-# NODE 1: Indexer
+# NODE 1: Fast Indexer (Azure Speech)
 # ============================================================================
-def index_video_node(state: VideoAuditState) -> Dict[str, Any]:
-    """Downloads YouTube video from URL, uploads to Azure Video Indexer, and extracts insights."""
+def index_video_node_fast(state: VideoAuditState) -> Dict[str, Any]:
+    """Fast video processing using Azure Speech instead of Video Indexer."""
     video_url = state.get("video_url")
     video_id_input = state.get("video_id", "vid_demo")
-    logger.info(f"--- [Node: Indexer] Processing: {video_url} ---")
+    logger.info(f"--- [Node: Fast Indexer] Processing: {video_url} ---")
 
     if not isinstance(video_url, str) or not is_youtube_url(video_url):
         return {
             "errors": ["Please provide a valid YouTube URL."],
             "final_status": "FAIL",
             "transcript": "",
-            "transcript_segments": [],
             "ocr_text": [],
         }
 
     # Check cache first
-    cached = get_cached_result(video_url, mode="full")
+    cached = get_cached_result(video_url, mode="fast")
     if cached:
-        logger.info("--- [Node: Indexer] Using cached result ---")
+        logger.info("--- [Node: Fast Indexer] Using cached result ---")
         return cached
 
     local_filename = f"temp_audit_video_{uuid.uuid4().hex}.mp4"
     local_path = local_filename
 
     try:
+        # Download video (same as before)
         vi_service = VideoIndexerService()
-
-        # Download video via yt-dlp
         local_path = vi_service.download_youtube_video(
             video_url, output_path=local_filename
         )
 
-        # Upload to Azure Video Indexer
-        azure_video_id = vi_service.upload_video(
-            local_path, video_name=video_id_input
-        )
-        logger.info(f"Upload Success. Azure ID: {azure_video_id}")
+        transcriber = AzureSpeechTranscriber()
+        result = transcriber.process_video(local_path)
 
-        # Wait for processing & extract data
-        raw_insights = vi_service.wait_for_processing(azure_video_id)
-        clean_data = vi_service.extract_data(raw_insights)
+        # Add video_id to result
+        result["video_id"] = video_id_input
 
-        # Save to cache
-        save_to_cache(video_url, clean_data, mode="full")
+        # Do not cache empty recognition results so transient failures can retry.
+        if result.get("transcript", "").strip():
+            save_to_cache(video_url, result, mode="fast")
 
-        logger.info("--- [Node: Indexer] Extraction Complete ---")
-        return clean_data
+        logger.info("--- [Node: Fast Indexer] Complete ---")
+        return result
 
     except Exception as e:
-        logger.error(f"Video Indexer failed: {e}")
+        logger.error(f"Fast indexer failed: {e}")
         return {
             "errors": [str(e)],
             "final_status": "FAIL",
             "transcript": "",
-            "transcript_segments": [],
             "ocr_text": [],
         }
     finally:
         if os.path.exists(local_path):
             os.remove(local_path)
 
+
 # ============================================================================
-# NODE 2: Compliance Auditor
+# NODE 2: Compliance Auditor (same as before)
 # ============================================================================
 def audit_content_node(state: VideoAuditState) -> Dict[str, Any]:
     """Performs RAG to audit brand video content using Azure OpenAI LLM."""
@@ -95,30 +93,27 @@ def audit_content_node(state: VideoAuditState) -> Dict[str, Any]:
     logger.info("--- [Node: Auditor] Querying Knowledge Base & LLM ---")
 
     transcript = state.get("transcript", "")
-    
+
     if not transcript:
-        logger.warning("No transcript or OCR text available. Skipping audit.")
+        logger.warning("No transcript available. Skipping audit.")
         return {
             "final_status": "FAIL",
-            "final_report": (
-                "Audit skipped because video processing failed."
-            )
+            "final_report": "Audit skipped because video processing failed."
         }
-
 
     llm = AzureChatOpenAI(
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         azure_deployment=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT"),
         api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-        )
+    )
 
     embeddings = AzureOpenAIEmbeddings(
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         azure_deployment=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT"),
         api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-        )
+    )
 
     vector_store = AzureSearch(
         azure_search_endpoint=os.getenv("AZURE_SEARCH_ENDPOINT"),
@@ -127,44 +122,30 @@ def audit_content_node(state: VideoAuditState) -> Dict[str, Any]:
         embedding_function=embeddings.embed_query,
     )
 
-
-        # ------------------------------------------------------------
-        # 2. RAG Retrieval
-        # ------------------------------------------------------------
-    ocr_text=state.get("ocr_text",[])
+    # RAG Retrieval
+    ocr_text = state.get("ocr_text", [])
     query_text = f"{transcript[:6000]} {' '.join(ocr_text)[:3000]}"
 
-    docs = vector_store.similarity_search(
-            query_text,
-            k=3
-        )
+    docs = vector_store.similarity_search(query_text, k=3)
 
     if not docs:
         logger.warning(
             "--- [Node: Auditor] WARNING: No documents retrieved from Azure Search. "
-            "The knowledge base may be empty. Run backend/scripts/index_documents.py first."
+            "Run backend/scripts/index_documents.py first."
         )
 
-    retrieved_rules = "\n\n".join(
-           [doc.page_content for doc in docs]
-        )
+    retrieved_rules = "\n\n".join([doc.page_content for doc in docs])
 
-
-    
-
-    # ------------------------------------------------------------
-     # 3. Prompt
-    # ------------------------------------------------------------
-
+    # Prompt
     system_prompt = f"""
-   You are a senior  video compliance auditor.
+You are a senior video compliance auditor.
 OFFICIAL REGULATORY RULES:
 {retrieved_rules}
 
 Instructions:
-1. Analyze the Transcript and OCT text below 
-2. Identify any vilations of the rules
-3.Return strictly JSON in the following format
+1. Analyze the Transcript and OCR text below
+2. Identify any violations of the rules
+3. Return strictly JSON in the following format
 JSON FORMAT SPECIFICATION:
 {{
   "video_summary": "<2-4 sentence factual summary of what the video says/shows>",
@@ -174,54 +155,45 @@ JSON FORMAT SPECIFICATION:
       "severity": "CRITICAL",
       "category": "<Category Name, e.g., Claim Validation, Endorsement Disclosure>",
       "description": "<Detailed explanation of the specific violation found and why it matters>",
-    
     }}
   ],
   "status": "FAIL",
   "final_report": "summary of findings"
- if no violations are found ,set "status" to  "PASS" and compliance results to []
-
+}}
+If no violations are found, set "status" to "PASS" and compliance_results to []
 """
-
 
     user_message = f"""
-        VIDEO METADATA:{json.dumps(state.get('video_metadata', {}))}
-        TRANSCRIPT:{transcript}
-        ON_SCREEN TEXT(OCR):{ocr_text}
+VIDEO METADATA: {json.dumps(state.get('video_metadata', {}))}
+TRANSCRIPT: {transcript}
+ON_SCREEN TEXT (OCR): {ocr_text}
 """
 
-
-        # ------------------------------------------------------------
-        # 4. LLM Call
-        # ------------------------------------------------------------
+    # LLM Call
     try:
-        response = llm.invoke(
-            [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_message),
-            ]
-        )
-        content=response.content
-        if "```" in content:
-            content=re.search(r"```(?:json)?(.*?)```",content,re.DOTALL).group(1)
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_message),
+        ])
 
-        audit_data=json.loads(content.strip())
-        return{
-            "compliance_results": audit_data.get("compliance_results",[]),
-            "final_status": audit_data.get("status","FAIL"),
-            "final_report":audit_data.get("final_report","No report generated"),
+        content = response.content
+        if "```" in content:
+            content = re.search(r"```(?:json)?(.*?)```", content, re.DOTALL).group(1)
+
+        audit_data = json.loads(content.strip())
+
+        return {
+            "compliance_results": audit_data.get("compliance_results", []),
+            "final_status": audit_data.get("status", "FAIL"),
+            "final_report": audit_data.get("final_report", "No report generated"),
             "video_summary": audit_data.get("video_summary", ""),
             "risk_score": audit_data.get("risk_score", 0),
             "retrieved_rules": [doc.page_content for doc in docs],
         }
 
     except Exception as e:
-
-        logger.error(
-            f"System Error in Auditor Node: {str(e)}"
-        )
-        logger.error(f"Raw LLM response:{response.content if 'response' in locals() else 'None'}")
-
+        logger.error(f"System Error in Auditor Node: {str(e)}")
+        logger.error(f"Raw LLM response: {response.content if 'response' in locals() else 'None'}")
 
         return {
             "errors": [str(e)],

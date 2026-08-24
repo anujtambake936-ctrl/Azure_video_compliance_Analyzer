@@ -9,10 +9,29 @@ import time
 import requests
 import yt_dlp
 from azure.identity import AzureCliCredential
+from urllib.parse import urlparse
 
 
 
 logger = logging.getLogger("video-indexer")
+
+REQUEST_TIMEOUT = (10, 120)
+
+
+def is_youtube_url(url: str) -> bool:
+    """Return whether URL uses a supported, exact YouTube hostname."""
+    try:
+        parsed = urlparse(url)
+    except (TypeError, ValueError):
+        return False
+
+    return parsed.scheme in {"http", "https"} and parsed.hostname in {
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "youtu.be",
+        "www.youtu.be",
+    }
 
 
 class VideoIndexerService:
@@ -46,10 +65,14 @@ class VideoIndexerService:
         headers = {"Authorization": f"Bearer {arm_access_token}"}
         payload = {"permissionType": "Contributor", "scope": "Account"}
 
-        response = requests.post(url, headers=headers, json=payload)
-        if response.status_code != 200:
-            raise Exception(f"Failed to get VI Account token: {response.text}")
-        return response.json().get("accessToken")
+        response = requests.post(
+            url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+        access_token = response.json().get("accessToken")
+        if not access_token:
+            raise RuntimeError("Video Indexer returned no account access token")
+        return access_token
 
     def download_youtube_video(
         self, url: str, output_path: str = "temp_video.mp4"
@@ -96,12 +119,15 @@ class VideoIndexerService:
         with open(video_path, "rb") as video_file:
             files = {"file": video_file}
             logger.info(f"Upload URL: {api_url}")
-            response = requests.post(api_url, params=params, files=files)
+            response = requests.post(
+                api_url, params=params, files=files, timeout=REQUEST_TIMEOUT
+            )
 
-        if response.status_code != 200:
-            raise Exception(f"Azure Upload Failed: {response.text}")
+        response.raise_for_status()
 
         azure_video_id = response.json().get("id")
+        if not azure_video_id:
+            raise RuntimeError("Azure Video Indexer returned no video ID")
         return azure_video_id
 
     def wait_for_processing(self, video_id: str) -> dict:
@@ -111,7 +137,7 @@ class VideoIndexerService:
         arm_token = self.get_access_token()
         vi_token = self.get_account_token(arm_token)
         poll_seconds = int(os.getenv("AZURE_VI_POLL_SECONDS", "30"))
-        max_wait_seconds = int(os.getenv("AZURE_VI_MAX_WAIT_SECONDS", "300"))
+        max_wait_seconds = int(os.getenv("AZURE_VI_MAX_WAIT_SECONDS", "900"))  # 15 min timeout
         deadline = time.monotonic() + max_wait_seconds
 
         while True:
@@ -119,7 +145,8 @@ class VideoIndexerService:
             url = f"https://api.videoindexer.ai/{self.location}/Accounts/{self.account_id}/Videos/{video_id}/Index"
             params = {"accessToken": vi_token}
 
-            response = requests.get(url, params=params)
+            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
             data = response.json()
 
             state = data.get("state")
@@ -139,7 +166,7 @@ class VideoIndexerService:
                 )
 
             logger.info(f"Status: {state}... waiting {poll_seconds}s")
-            time.sleep(30)
+            time.sleep(poll_seconds)
 
     def extract_data(self, vi_json):
         """Parses the raw Azure Video Indexer JSON into our VideoAuditState schema."""

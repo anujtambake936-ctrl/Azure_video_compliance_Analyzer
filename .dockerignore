@@ -1,0 +1,16 @@
+.git
+.venv
+.env
+*.log
+temp_audit_video_*.mp4
+backend/cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.DS_Store
+.idea/
+.vscode/
