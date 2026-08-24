@@ -277,12 +277,13 @@ When `APPLICATION_INSIGHTS_CONNECTION_STRING` is set, the API server initializes
 
 ## Performance & Deployment
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for:
-- Async job queue architecture (202 Accepted pattern)
-- Video processing cache (instant results for repeat audits)
-- Docker / Azure Container Apps / AKS deployment guides
-- Production checklist and monitoring setup
-- Cost estimates and scaling strategies
+For local container execution, use:
+
+```bash
+docker compose up --build
+```
+
+The API uses the `202 Accepted` job pattern and polls results through `/audit/{job_id}`. The Docker setup is suitable for demos; production deployment still requires durable job storage, managed identity, authentication, rate limiting, and secret management.
 
 ## Prototype Scope
 
